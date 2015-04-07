@@ -15,6 +15,7 @@ use Symfony\Component\BrowserKit\Cookie;
 use Symfony\Component\CssSelector\CssSelector;
 use Symfony\Component\CssSelector\Exception\ParseException;
 use Symfony\Component\DomCrawler\Crawler;
+use Symfony\Component\DomCrawler\Form;
 use Symfony\Component\DomCrawler\Field\ChoiceFormField;
 use Symfony\Component\DomCrawler\Field\FileFormField;
 use Symfony\Component\DomCrawler\Field\FormField;
@@ -100,8 +101,9 @@ class InnerBrowser extends Module implements Web
         $buttonText = str_replace('"',"'", $link);
         $button = $this->crawler->selectButton($buttonText);
         if (count($button)) {
-            $this->submitFormWithButton($button);
-            $this->debugResponse();
+            //$this->submitFormWithButton($button);
+            $this->proceedSubmitForm($button->parents()->filter('form')->first(), [], $buttonText);
+            //$this->debugResponse();
             return;
         }
 
@@ -138,7 +140,7 @@ class InnerBrowser extends Module implements Web
 
     protected function submitFormWithButton($button)
     {
-        $form    = $this->getFormFor($button);
+        $form = $this->getFormFor($button);
 
         // Only now do we know which submit button was pressed.
         // Add it to the form object.
@@ -320,30 +322,19 @@ class InnerBrowser extends Module implements Web
 
     protected function proceedSeeInField(Crawler $fields, $value)
     {
-        $currentValues = [];
-        if ($fields->filter('textarea')->count() !== 0) {
-            $currentValues = $fields->filter('textarea')->extract(array('_text'));
-        } elseif ($fields->filter('select')->count() !== 0) {
-            $currentValues = $fields->filter('select option:selected')->extract(array('value'));
-            if (empty($value) && empty($currentValues)) {
-                return ['True', true];
-            }
-        } elseif ($fields->filter('input[type=radio],input[type=checkbox]')->count() !== 0) {
-            if (is_bool($value)) {
-                $currentValues = [$fields->filter('input:checked')->count() > 0];
-            } else {
-                $currentValues = $fields->filter('input:checked')->extract(array('value'));
-            }
-        } else {
-            $currentValues = $fields->extract(array('value'));
-        }
+        $form = $this->getFormFor($fields);
+        $currentValues = $this->getFormValuesFor($form);
+        $strField = $this->getSubmissionFormFieldName($fields->attr('name'));
         
-        $strField = $fields->attr('name');
+        $testValues = (isset($currentValues[$strField])) ? $currentValues[$strField] : '';
+        if (!is_array($testValues)) {
+            $testValues = [$testValues];
+        }
         return [
             'Contains',
             $value,
-            $currentValues,
-            "Failed testing for '$value' in $strField's value: " . implode(', ', $currentValues)
+            $testValues,
+            "Failed testing for '$value' in $strField's value: " . var_export($currentValues)
         ];
     }
 
@@ -406,52 +397,19 @@ class InnerBrowser extends Module implements Web
         return $params;
     }
 
-    public function submitForm($selector, $params, $button = null)
+    protected function proceedSubmitForm(Crawler $form, $params, $button)
     {
-        $form = $this->match($selector)->first();
-
-        if (!count($form)) {
-            throw new ElementNotFound($selector, 'Form');
-        }
-
-        $defaults = [];
-        /** @var  \Symfony\Component\DomCrawler\Crawler|\DOMElement[] $fields */
-        $fields = $form->filter('input:enabled,textarea:enabled,select:enabled,button:enabled,input[type=hidden]');
-        foreach ($fields as $field) {
-            $fieldName = $this->getSubmissionFormFieldName($field->getAttribute('name'));
-            if (($field->getAttribute('type') === 'checkbox' || $field->getAttribute('type') === 'radio') && !$field->hasAttribute('checked')) {
-                continue;
-            } elseif ($field->getAttribute('type') === 'button') {
-                continue;
-            } elseif (($field->getAttribute('type') === 'submit' || $field->tagName === 'button') && $field->getAttribute('name') !== $button) {
-                continue;
-            } elseif ($field->tagName === 'select') {
-                $values = [];
-                $select = new Crawler($field);
-                $options = $select->filter('option:enabled:selected');
-                foreach ($options as $option) {
-                    $values[] = $option->getAttribute('value');
-                    if (!$field->hasAttribute('multiple')) {
-                        break;
-                    }
-                }
-                if (count($values) > 1) {
-                    $defaults[$fieldName] = $values;
-                } elseif (count($values) === 1) {
-                    $defaults[$fieldName] = reset($values);
-                }
-                continue;
-            }
-            // <button> tags have both, nodeValue is set to the content of the <button> tag, so preference is for "value" first
-            if ($field->hasAttribute('value')) {
-                $defaults[$fieldName] = $field->getAttribute('value');
-            } else {
-                $defaults[$fieldName] = $field->nodeValue;
-            }
-        }
-
+        $formOb = $this->getFormFor($form);
+        $defaults = $this->getFormValuesFor($formOb);
         $merged = array_merge($defaults, $params);
         $requestParams = $this->setCheckboxBoolValues($form, $merged);
+        
+        if (!empty($button)) {
+            $btnOb = $form->filterXPath(sprintf('//*[not(@disabled) and @type="submit" and @name=%s]', Crawler::xpathLiteral($button)));
+            if (count($btnOb)) {
+                $requestParams[$button] = $btnOb->attr('value');
+            }
+        }
 
         $method = $form->attr('method') ? $form->attr('method') : 'GET';
         $query = '';
@@ -464,6 +422,15 @@ class InnerBrowser extends Module implements Web
 
         $this->crawler = $this->client->request($method, $this->getFormUrl($form) . $query, $requestParams);
         $this->debugResponse();
+    }
+
+    public function submitForm($selector, $params, $button = null)
+    {
+        $form = $this->match($selector)->first();
+        if (!count($form)) {
+            throw new ElementNotFound($selector, 'Form');
+        }
+        $this->proceedSubmitForm($form, $params, $button);
     }
 
     /**
@@ -513,40 +480,44 @@ class InnerBrowser extends Module implements Web
      *
      * @return \Symfony\Component\DomCrawler\Form|\Symfony\Component\DomCrawler\Field\ChoiceFormField[]|\Symfony\Component\DomCrawler\Field\FileFormField[]
      */
-    protected function getFormFor($node)
+    protected function getFormFor(Crawler $node)
     {
         $form = $node->parents()->filter('form')->first();
         if (!$form) {
             $this->fail('The selected node does not have a form ancestor.');
         }
         $action = $this->getFormUrl($form);
-
-        if (isset($this->forms[$action])) {
-            return $this->forms[$action];
+        if (!isset($this->forms[$action])) {
+            $cloned = new Crawler(clone($form->getNode(0)), $this->_getUrl());
+            // Symfony's DomCrawler form object doesn't account for elements disabled
+            // higher up (like by fieldset) and for disabled select options
+            $shouldDisable = $cloned->filter('input:disabled:not([disabled]),select option:disabled,select optgroup:disabled option:not([disabled])');
+            foreach ($shouldDisable as $field) {
+                $field->parentNode->removeChild($field);
+            }
+            $this->forms[$action] = $cloned->form();
         }
-
-        $formSubmits = $form->filter('*[type=submit]');
-
-        // Inject a submit button if there isn't one.
-        if ($formSubmits->count() == 0) {
-            $autoSubmit = new \DOMElement('input');
-            $form->rewind();
-            $autoSubmit = $form->current()->appendChild($autoSubmit);
-            $autoSubmit->setAttribute('type', 'submit'); // for forms with no submits
-            $autoSubmit->setAttribute('name', 'codeception_added_auto_submit');
-        }
-
-        // Retrieve the store the Form object.
-        $this->forms[$action] = $form->form();
-
         return $this->forms[$action];
+    }
+    
+    /**
+     * Filters out 
+     */
+    protected function getFormValuesFor(Form $form)
+    {
+        $values = [];
+        $fields = $form->all();
+        foreach ($fields as $field) {
+            $values[$this->getSubmissionFormFieldName($field->getName())] = $field->getValue();
+        }
+        return $values;
     }
 
     public function fillField($field, $value)
     {
-        $input                      = $this->getFieldByLabelOrCss($field);
-        $form                       = $this->getFormFor($input);
-        $name                       = $input->attr('name');
+        $input = $this->getFieldByLabelOrCss($field);
+        $form = $this->getFormFor($input);
+        $name = $input->attr('name');
 
         $dynamicField = $input->getNode(0)->tagName == 'textarea'
             ? new TextareaFormField($input->getNode(0))

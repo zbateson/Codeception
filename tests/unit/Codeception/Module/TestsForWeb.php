@@ -879,6 +879,7 @@ abstract class TestsForWeb extends \PHPUnit_Framework_TestCase
     public function testSubmitFormWithMultiSelect()
     {
         $this->module->amOnPage('/form/submitform_multiple');
+        $this->module->seeElement('//select/optgroup/option');
         $this->module->submitForm('form', []);
         $form = data::get('form');
         $this->assertCount(2, $form['select']);
